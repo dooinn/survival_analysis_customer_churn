@@ -1,0 +1,1315 @@
+---
+title: "Customer_Churn"
+author: "Dooinn KIM"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(survival)
+library(janitor)
+library(ggplot2)
+library(survminer)
+library(dplyr)
+
+
+```
+
+## Data import
+Dataset avaialbe @ https://www.kaggle.com/datasets/muhammadshahidazeem/customer-churn-dataset
+
+```{r}
+df <- read_csv("data.csv")
+```
+```{r}
+df
+```
+**Variables**:
+
+- ID: CustomerID (identifier, not used in modeling).
+- Demographics: Age, Gender.
+- Behavioral: Usage Frequency, Support Calls, Payment Delay, Total Spend, Last Interaction.
+- Contractual: Tenure, Subscription Type, Contract Length.
+- Outcome: Churn (0 = active, 1 = churned).
+
+```{r}
+str(df)
+summary(df)
+colSums(is.na(df))
+
+```
+```{r}
+df <- na.omit(df)
+df <- df %>% clean_names(case = "snake")
+```
+
+
+```{r}
+# We mutate to factors so that R understands these variables as categorical, creates the right dummy variables, and gives hazard ratios that make sense.
+df <- df %>% mutate(
+  gender = as.factor(gender),
+  subscription_type = as.factor(subscription_type),
+  contract_length = as.factor(contract_length)
+)
+```
+
+# Churn Distribution
+
+- 0 = Active (censored)
+- 1= Churned (event)
+
+- 43% of customers are still active
+- 56 % have churned
+
+```{r}
+
+# Frequency bar plot
+barplot(table(df$churn), 
+        col = c("steelblue", "tomato"),
+        main = "Churn Frequency",
+        ylab = "Count")
+
+table(df$churn)
+prop.table(table(df$churn))
+
+```
+
+
+## Distibution of Tenure
+
+**1. Summary**:
+
+- Median = 32 months → half of customers churn/are censored before ~2.5 years, half after.
+- Distribution is fairly uniform across months, with a slight peak at month 1.
+
+**2. Histogram of tenure**:
+
+- Big spike at 1 month → many customers churn or are censored almost immediately (early drop-off).
+- After that, tenure is roughly evenly spread between 2 and 60 months.
+- This suggests early disengagement is a major issue (lots of customers don’t “stick” after the first month).
+
+**3. Boxplot: Tenure vs Churn**
+
+- Median tenure for churned customers (Churn = 1) is lower than for active customers.
+- Active customers: median ~32 months.
+- Churned customers: median closer to ~29 months.
+- Distribution spreads overlap a lot, but churners are slightly skewed toward shorter tenure.
+- This indicates customers who churn tend to leave earlier than those who stay.
+
+**Key insights**
+
+- Early churn (at month 1) is a critical business issue. Many customers leave right away.
+- Churners generally have shorter tenure than retained customers, though the difference is not massive — churn happens across the full range of tenure.
+- This pattern validates using survival analysis: the timing of churn is clearly informative, not just whether churn happens.
+
+```{r}
+summary(df$tenure)
+
+hist(df$tenure, breaks = 50, col = "skyblue",
+     main = "Distribution of Tenure",
+     xlab = "Tenure (months)")
+
+boxplot(tenure ~ churn, data = df,
+        main = "Tenure vs Churn",
+        xlab = "Churn (0=Active, 1=Churned)",
+        ylab = "Tenure (months)",
+        col = c("lightgreen", "salmon"))
+
+active <- df$tenure[df$churn == 0]
+churned <- df$tenure[df$churn == 1]
+
+par(mfrow = c(1, 2))
+
+hist(active, breaks = 50, col = "lightgreen", freq = FALSE,
+     main = "Tenure Distribution - Active",
+     xlab = "Tenure (months)", xlim = c(0, 60))
+lines(density(active), col = "darkgreen", lwd = 2)
+
+hist(churned, breaks = 50, col = "salmon", freq = FALSE,
+     main = "Tenure Distribution - Churned",
+     xlab = "Tenure (months)", xlim = c(0, 60))
+lines(density(churned), col = "red4", lwd = 2)
+
+par(mfrow = c(1, 1))
+
+```
+
+## Descriptive Analysis of Categorical Predictors.
+
+** 1. Gender **
+
+Counts:
+- Female = 190,580 (43%)
+- Male = 250,252 (57%)
+
+Churn distribution:
+- Females: 66.7% churned, 33.3% active
+- Males: 49.1% churned, 50.9% active
+
+Interpretation:
+- Females churn at a much higher rate than males.
+- Males are more likely to remain active customers.
+- Gender is likely an important predictor of churn.
+
+** 2. Subscription Type ** 
+
+Counts:
+- Basic = 143,026 (32.4%)
+- Premium = 148,678 (33.7%)
+- Standard = 149,128 (33.8%)
+
+Churn distribution:
+- Basic: 58.2% churned, 41.8% active
+- Premium: 55.9% churned, 44.1% active
+- Standard: 56.1% churned, 43.9% active
+
+Interpretation:
+- All three subscription types have very similar churn rates (~56–58%).
+- Basic is slightly riskier, but differences are small.
+- Subscription type may have limited predictive power compared to gender.
+
+
+** 3. Contract Length ** 
+
+Counts:
+- Annual = 177,198 (40.2%)
+- Monthly = 87,104 (19.8%)
+- Quarterly = 176,530 (40.0%)
+
+Churn distribution:
+- Annual: 46.1% churned, 53.9% active
+- Monthly: 100% churned (no active customers!)
+- Quarterly: 46.0% churned, 54.0% active
+
+Interpretation:
+- Huge insight: Monthly contract customers all churned.
+- This makes sense — short-term contracts often have no lock-in, so customers can leave immediately.
+- Annual and Quarterly contracts have much better retention (almost identical, ~46% churn).
+- Contract length is an extremely strong predictor of churn.
+
+
+** Summary of categorical predictors **
+- Gender: Female churn rate is much higher → strong predictor.
+- Subscription type: Similar churn rates across groups → weak predictor.
+- Contract length: The most powerful predictor (monthly contracts = guaranteed churn).
+
+
+```{r}
+# Gender
+table(df$gender)
+prop.table(table(df$gender))
+
+table(df$churn, df$gender)
+prop.table(table(df$churn, df$gender), margin = 2) 
+
+barplot(prop.table(table(df$churn, df$gender), margin = 2),
+        beside = TRUE, col = c("lightgreen", "salmon"),
+        legend = c("Active", "Churned"),
+        main = "Churn by Gender")
+
+# Subscription Type
+table(df$subscription_type)
+prop.table(table(df$subscription_type))
+
+table(df$churn, df$subscription_type)
+prop.table(table(df$churn, df$subscription_type), margin = 2)
+
+barplot(prop.table(table(df$churn, df$subscription_type), margin = 2),
+        beside = TRUE, col = c("lightgreen", "salmon"),
+        legend = c("Active", "Churned"),
+        main = "Churn by Subscription Type")
+
+
+# Contract Length
+table(df$contract_length)
+prop.table(table(df$contract_length))
+
+table(df$churn, df$contract_length)
+prop.table(table(df$churn, df$contract_length), margin = 2)
+
+barplot(prop.table(table(df$churn, df$contract_length), margin = 2),
+        beside = TRUE, col = c("lightgreen", "salmon"),
+        legend = c("Active", "Churned"),
+        main = "Churn by Contract Length")
+
+
+```
+
+
+```{r}
+# Histograms
+hist(df$age, main="Age Distribution", col="lightgreen", xlab="Age")
+hist(df$usage_frequency, main="Usage Frequency", col="lightblue", xlab="Usage Frequency")
+hist(df$support_calls, main="Support Calls", col="orange", xlab="Support Calls")
+hist(df$payment_delay, main="Payment Delay", col="red", xlab="Payment Delay")
+hist(df$total_spend, main="Total Spend", col="purple", xlab="Total Spend")
+
+```
+## Continuous predictors (age, usage_frequency, support_calls, payment_delay, total_spend, last_interaction) vs churn
+
+** 1. Age **
+- Churned customers are older on average (median ~41).
+- Active customers are younger (median ~37).
+- Older customers appear more likely to churn than younger ones.
+
+** 2.Usage Frequency **
+- Active customers have higher usage (median ~16).
+- Churned customers use the service less (median ~14).
+- Low engagement (lower frequency) is linked to churn risk.
+
+** 3. Support Calls **
+- Churned customers contact support more often (median ~5 calls).
+- Active customers contact support less (median ~1 call).
+- Frequent support calls could reflect problems or dissatisfaction, leading to churn.
+
+** 4. Payment Delay **
+- Churned customers have longer delays (median ~15 days).
+- Active customers have shorter delays (median ~10 days).
+- Poor payment behavior is a warning signal for churn.
+
+** 5. Total Spend **
+- Active customers spend much more (median ~750).
+- Churned customers spend less (median ~500).
+- Higher spenders are more loyal, while low spenders are more likely to churn.
+
+** 6. Last Interaction **
+- Churned customers had their last interaction longer ago (median ~15).
+- Active customers interacted more recently (median ~11).
+- Recent engagement reduces churn risk — inactivity is a churn predictor.
+
+** Key Insights from Continuous Predictors ** 
+
+- Higher churn risk: older, low-usage, frequent support calls, delayed payments, lower spending, and longer since last interaction.
+- Protective factors: higher engagement, on-time payments, higher spending, recent activity.
+- This aligns perfectly with business intuition: disengaged, frustrated, or low-value customers churn earlier.
+
+```{r}
+
+boxplot(age ~ churn, data=df,
+        main="Age vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+boxplot(usage_frequency ~ churn, data=df,
+        main="Usage Frequency vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+boxplot(support_calls ~ churn, data=df,
+        main="Support Calls vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+boxplot(payment_delay ~ churn, data=df,
+        main="Payment Delay vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+boxplot(total_spend ~ churn, data=df,
+        main="Total Spend vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+boxplot(last_interaction ~ churn, data=df,
+        main="Last Interaction vs Churn", col=c("lightgreen","salmon"),
+        names=c("Active","Churned"))
+
+```
+
+** Customer Churn Profile (Descriptive Analysis Summary) **
+
+
+** Outcome & Time **
+
+Churn rate: 
+- ~56% of customers churned, 44% still active.
+
+Tenure:
+- Median = 32 months.
+- Large spike at 1 month → many customers leave immediately.
+- Churners generally have shorter tenure than active customers.
+
+
+
+** Categorical Predictors **
+
+Gender:
+- Females: 66.7% churned.
+- Males: 49.1% churned.
+- Females churn more often; being male is protective.
+
+Subscription Type
+- Basic, Standard, Premium all have similar churn (~56–58%).
+- Subscription type has little impact on churn.
+
+Contract Length
+- Monthly: 100% churned (no active customers).
+
+Annual & Quarterly: only ~46% churned.
+- Contract length is the strongest predictor: short contracts = guaranteed churn.
+
+
+
+** Continuous Predictors **
+
+Age
+- Older customers churn more (median ~41 vs ~37).
+- Age positively related to churn.
+
+Usage Frequency
+- Churners use the service less often.
+- Lower engagement = higher churn.
+
+Support Calls
+- Churners contact support far more (median ~5 vs ~1).
+- Customer frustration strongly linked to churn.
+
+Payment Delay
+- Churners delay payments longer (median ~15 days vs ~10).
+- Poor payment behavior predicts churn.
+
+Total Spend
+- Active customers spend more (median ~750 vs ~500).
+- High spenders are more loyal.
+
+Last Interaction
+- Churners interacted less recently (median ~15 vs ~11).
+- Inactivity predicts churn.
+
+
+** Curner Profile **
+
+Most likely to churn:
+
+- Female
+- On a monthly contract
+- Older age
+- Lower usage frequency
+- More support calls
+- Longer payment delays
+- Lower spend
+- Longer since last interaction
+
+Most likely to stay:
+
+- Male
+- On annual or quarterly contracts
+- Younger
+- Higher engagement (usage frequency)
+- Fewer support calls
+- Pay on time
+- Higher spending
+- Recent interaction
+
+
+## Kaplan–Meier (Overall Survival)
+```{r}
+library(survival)
+library(survminer)
+
+surv_obj <- Surv(time = df$tenure, event = df$churn)
+
+km_fit <- survfit(surv_obj ~ 1, data = df)
+
+summary(km_fit)
+
+ggsurvplot(
+  km_fit, 
+  conf.int = TRUE, 
+  risk.table = TRUE,
+  surv.median.line = "hv",
+  title = "Overall Customer Survival Curve",
+  xlab = "Tenure (months)", 
+  ylab = "Survival Probability"
+)
+```
+** Interpretation **
+
+Starting point
+- At tenure = 0, survival probability = 1.0 (100% of customers are active at the start).
+
+Decline over time
+- The curve steadily decreases as tenure increases.
+- Around 30 months, survival probability is ~0.65 → meaning 65% of customers remain active at 2.5 years.
+- Around 60 months, survival probability is close to 0 → meaning almost all customers have churned by 5 years.
+
+Early churn
+- The curve shows a noticeable steeper drop in the early months, confirming what we saw in the tenure histogram — many customers leave early (especially at month 1).
+
+Number at risk table
+- Shows how many customers are still under observation at different time points.
+- Starts with 440,832, and by month 60 only 7,658 are left at risk.
+- This demonstrates both churn events and right-censoring.
+
+Key Takeaways
+- Customer survival probability drops quickly in the first year, then declines steadily.
+- Long-term retention is difficult: very few customers survive past 5 years.
+- Confirms the importance of early customer engagement and retention strategies.
+
+
+
+
+
+## Kaplan–Meier (Gender)
+
+```{r}
+km_gender <- survfit(surv_obj ~ gender, data = df)
+
+summary(km_gender)
+
+ggsurvplot(
+  km_gender,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  title = "Survival Curves by Gender",
+  xlab = "Tenure (months)",
+  ylab = "Survival Probability",
+  legend.labs = c("Female", "Male"),
+  palette = c("salmon", "skyblue"),
+  risk.table.height = 0.35,     
+  risk.table.y.text.col = TRUE, 
+  risk.table.y.text = FALSE     
+)
+
+
+```
+
+** Interpretation of Gender Survival Curves **
+
+Curve shapes
+- Both curves decline gradually over time, but female survival is consistently lower than male survival.
+- The gap becomes more noticeable after ~20 months and widens as tenure increases.
+
+Survival probabilities
+At 30 months:
+- Male survival ≈ 0.70
+- Female survival ≈ 0.63
+
+At 60 months:
+- Male survival ≈ 0.20
+- Female survival ≈ 0.05
+
+This means males are more likely to remain active customers at every tenure point.
+
+
+Statistical test
+- p-value < 0.0001 (log-rank test) → the difference between male and female survival is statistically significant.
+- So the observed difference is not random noise — gender truly impacts survival.
+
+Number at risk table
+- Confirms the dataset size: ~190K females, ~250K males at start.
+- Even at 60 months, males retain ~4,367 active customers vs only ~3,291 females.
+- This reinforces that male customers survive longer on average.
+
+
+
+Key Takeaway
+- Gender matters: Female customers churn faster, while male customers show higher long-term retention.
+- This confirms what we saw in descriptive stats and boxplots.
+- Gender should definitely be included in the survival model as a predictor.
+
+
+
+## Kaplan–Meier  (Contract Length)
+```{r}
+
+km_contract <- survfit(surv_obj ~ contract_length, data = df)
+
+summary(km_contract)
+
+ggsurvplot(
+  km_contract,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  surv.median.line = "hv",
+  title = "Survival Curves by Contract Length",
+  xlab = "Tenure (months)",
+  ylab = "Survival Probability",
+  legend.labs = c("Annual", "Monthly", "Quarterly"),
+  palette = c("darkgreen", "red", "blue"),
+  risk.table.height = 0.35,
+  risk.table.y.text.col = TRUE,
+  risk.table.y.text = FALSE
+)
+
+```
+** Interpretation of Contract Length Survival Curves **
+
+Monthly contracts (red curve)
+- Survival declines much faster than Annual/Quarterly.
+- By ~30 months, survival probability is already below 0.5.
+- By 60 months, almost no monthly contract customers remain.
+- Confirms short contracts = high churn.
+
+
+Quarterly (blue) vs Annual (green)
+- Both decline more slowly and have much higher survival than monthly.
+- Annual and Quarterly are quite similar — survival ~0.5 at 60 months.
+- Long-term contracts protect against churn.
+
+
+Statistical test
+- p < 0.0001 → survival differences across contract lengths are highly significant.
+
+
+- Number at risk table
+- Starts with: Annual ~177K, Monthly ~87K, Quarterly ~176K.
+- By 60 months, only a few thousand remain in each group.
+- The drop-off for monthly is steepest, while annual & quarterly retain far more customers.
+
+
+Key Takeaway
+
+- Contract length is the single strongest predictor of survival.
+- Customers on monthly contracts churn much earlier than those on annual or quarterly contracts.
+- Annual and Quarterly contracts extend customer lifetime, with survival probabilities about 2x higher than monthly by the end of the observation period.
+
+
+## Kaplan–Meier  (Subscription type)
+
+```{r}
+km_subs <- survfit(surv_obj ~ subscription_type, data = df)
+
+ggsurvplot(
+  km_subs,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  surv.median.line = "hv",
+  title = "Survival Curves by Subscription Type",
+  xlab = "Tenure (months)",
+  ylab = "Survival Probability",
+  legend.labs = c("Basic", "Premium", "Standard"),
+  palette = c("orange", "purple", "blue"),
+  risk.table.height = 0.35,
+  risk.table.y.text.col = TRUE,
+  risk.table.y.text = FALSE
+)
+
+summary(km_subs)
+
+```
+** Interpretation of Subscription Type Survival Curves **
+
+Curve shapes
+- The three curves (Basic, Premium, Standard) almost completely overlap.
+- No group shows a noticeably faster or slower decline.
+
+Survival probabilities
+- At 30 months, all three are ~0.65 survival probability.
+- At 60 months, all three are close to 0.10–0.15 survival probability.
+- No meaningful difference in long-term retention between subscription types.
+
+Statistical test
+- p = 0.63 → not statistically significant.
+- Confirms what descriptive stats already suggested: subscription type has little or no effect on churn timing.
+
+Number at risk table
+- Each subscription type starts with ~143–149K customers.
+- By 60 months, only ~2,500–2,600 remain in each group.
+- The proportions are virtually the same across all types.
+
+Key Takeaway
+- Subscription type does not influence churn survival.
+- Basic, Standard, and Premium customers all churn at very similar rates.
+- From a modeling standpoint, subscription type may not add much predictive value.
+
+
+
+
+So far with Kaplan–Meier:
+
+- Gender: Significant difference (males survive longer).
+- Contract length: Very strong difference (monthly churns fastest).
+- Subscription type: No significant difference.
+
+
+
+
+
+## Nelson–Aalen Cumulative Hazard (Overall)
+
+- Estimates the cumulative hazard function H(t) instead of survival.
+- Hazard function describes the instantaneous risk of churn at time t.
+- Nelson–Aalen is often plotted alongside KM.
+
+```{r}
+km_fit <- survfit(surv_obj ~ 1, data = df)
+
+
+ggsurvplot(
+  km_fit,
+  fun = "cumhaz",                
+  conf.int = TRUE,              
+  risk.table = FALSE,             
+  title = "Nelson–Aalen Cumulative Hazard Curve",
+  xlab = "Tenure (months)",
+  ylab = "Cumulative Hazard"
+)
+
+fit_na_gender <- survfit(surv_obj ~ gender, data = df)
+
+ggsurvplot(
+  fit_na_gender,
+  fun = "cumhaz", 
+  conf.int = TRUE,
+  risk.table = FALSE,
+  title = "Nelson–Aalen Cumulative Hazard by Gender",
+  xlab = "Tenure (months)", ylab = "Cumulative Hazard",
+  legend.labs = c("Female", "Male"),
+  palette = c("salmon", "skyblue")
+)
+
+fit_na_contract <- survfit(surv_obj ~ contract_length, data = df)
+
+ggsurvplot(
+  fit_na_contract,
+  fun = "cumhaz", 
+  conf.int = TRUE,
+  risk.table = FALSE,
+  title = "Nelson–Aalen Cumulative Hazard by Contract Length",
+  xlab = "Tenure (months)", ylab = "Cumulative Hazard",
+  legend.labs = c("Annual", "Monthly", "Quarterly"),
+  palette = c("darkgreen", "red", "blue")
+)
+
+fit_na_subs <- survfit(surv_obj ~ subscription_type, data = df)
+
+ggsurvplot(
+  fit_na_subs,
+  fun = "cumhaz", 
+  conf.int = TRUE,
+  risk.table = FALSE,
+  title = "Nelson–Aalen Cumulative Hazard by Subscription Type",
+  xlab = "Tenure (months)", ylab = "Cumulative Hazard",
+  legend.labs = c("Basic", "Premium", "Standard"),
+  palette = c("orange", "purple", "blue")
+)
+```
+
+## Cumulative Incidence of Churn
+
+- Cumulative incidence = probability that an event (churn) has occurred by a certain time t. 
+- In other words, instead of asking “what % of customers are still active at 30 months?”, we ask “what % have churned by 30 months?”.
+
+```{r}
+
+km_fit <- survfit(surv_obj ~ 1, data = df)
+
+ggsurvplot(
+  km_fit,
+  fun = "event",  
+  conf.int = TRUE,
+  risk.table = TRUE,
+  title = "Cumulative Incidence of Churn (1 - Survival)",
+  xlab = "Tenure (months)",
+  ylab = "Cumulative Probability of Churn"
+)
+
+```
+Start point
+- At tenure = 0, cumulative incidence = 0 (no one churned yet).
+
+Steady rise
+- The curve increases gradually → showing more customers churn over time.
+- At ~30 months: cumulative incidence ≈ 35% → about one-third of customers have churned by 2.5 years.
+- At ~50 months: cumulative incidence ≈ 70% → about 7 in 10 customers have churned.
+- At ~60 months: cumulative incidence ≈ 95%+ → almost all customers churn within 5 years.
+
+Curve shape
+- The curve bends upward in later months → churn accelerates as customers stay longer.
+- This matches the Nelson–Aalen hazard curve, which showed risk piling up after ~40 months.
+
+Key Takeaway
+- Cumulative incidence of churn = probability of churn by time t.
+- “What % of my customers will have left by month X?”
+- By 2.5 years → ~1 in 3 customers churn.
+- By 5 years → nearly all customers churn.
+
+
+
+```{r}
+
+# 1. By Gender
+fit_cif_gender <- survfit(surv_obj ~ gender, data = df)
+ggsurvplot(
+  fit_cif_gender,
+  fun = "event",
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  title = "Cumulative Incidence of Churn by Gender",
+  xlab = "Tenure (months)", ylab = "Cumulative Probability of Churn",
+  legend.labs = c("Female", "Male"),
+  palette = c("salmon", "skyblue"),
+  risk.table.height = 0.35
+)
+
+# 2. By Contract Length
+fit_cif_contract <- survfit(surv_obj ~ contract_length, data = df)
+ggsurvplot(
+  fit_cif_contract,
+  fun = "event",
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  title = "Cumulative Incidence of Churn by Contract Length",
+  xlab = "Tenure (months)", ylab = "Cumulative Probability of Churn",
+  legend.labs = c("Annual", "Monthly", "Quarterly"),
+  palette = c("darkgreen", "red", "blue"),
+  risk.table.height = 0.35
+)
+
+# 3. By Subscription Type
+fit_cif_subs <- survfit(surv_obj ~ subscription_type, data = df)
+ggsurvplot(
+  fit_cif_subs,
+  fun = "event",
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  title = "Cumulative Incidence of Churn by Subscription Type",
+  xlab = "Tenure (months)", ylab = "Cumulative Probability of Churn",
+  legend.labs = c("Basic", "Premium", "Standard"),
+  palette = c("orange", "purple", "blue"),
+  risk.table.height = 0.35
+)
+
+
+
+```
+
+## Overall Hazard Function
+
+Among customers who have not yet churned at month t, what is the probability they will churn in the next instant (e.g., next month)?
+
+```{r}
+fit <- survfit(Surv(tenure, churn) ~ 1, data = df)
+
+haz_df <- data.frame(
+  time = fit$time,
+  cumhaz = -log(fit$surv)
+)
+
+haz_df$hazard <- c(haz_df$cumhaz[1], diff(haz_df$cumhaz))
+
+plot(haz_df$time, haz_df$hazard, type="l", col="blue", lwd=2,
+     main="Estimated Hazard Function of Churn",
+     xlab="Tenure (months)", ylab="Hazard")
+
+```
+Early months (0–20)
+- Hazard is very low (close to 0).
+- if a customer survives the very first months, their risk of churning remains modest.
+
+Middle period (20–40 months)
+- Hazard increases slightly but remains relatively low.
+- Risk of churn is steady and manageable.
+
+Later period (40–60 months)
+- Hazard grows exponentially.
+- At ~60 months, the hazard spikes → meaning customers who last this long are very likely to churn soon.
+- Matches what we saw in cumulative incidence: almost all customers churn by 5 years.
+
+
+
+** Role of the Hazard Function **
+
+- Complements survival probability
+
+Survival function 
+- S(t): “How many remain?”
+
+Hazard function 
+- h(t): “How risky is it right now?”
+
+Reveals churn dynamics
+- Early vs late risk: tells you when churn is most dangerous.
+- In the churn analysis, risk is low at the start but accelerates dramatically later.
+
+Inputs for modeling
+- In Cox regression, we model hazard ratios between groups (e.g., males vs females, annual vs monthly).
+- Helps quantify how predictors shift the risk curve.
+
+Business insight
+- Tells you when to intervene:
+- Early customers → onboarding & engagement.
+- Long-tenure customers → loyalty programs to stop late-stage churn.
+
+In short: The hazard function tells you “when churn risk is highest”, while the survival function tells you “how many customers remain”.
+
+
+```{r}
+groups <- split(df, df$gender)
+
+par(mfrow=c(1,2)) 
+for (g in names(groups)) {
+  fit <- survfit(Surv(tenure, churn) ~ 1, data = groups[[g]])
+  haz_df <- data.frame(
+    time = fit$time,
+    cumhaz = -log(fit$surv)
+  )
+  haz_df$hazard <- c(haz_df$cumhaz[1], diff(haz_df$cumhaz))
+  
+  plot(haz_df$time, haz_df$hazard, type="l", lwd=2,
+       main=paste("Hazard Function -", g),
+       xlab="Tenure (months)", ylab="Hazard")
+}
+par(mfrow=c(1,1))
+
+
+groups <- split(df, df$contract_length)
+
+par(mfrow=c(1,3)) 
+for (g in names(groups)) {
+  fit <- survfit(Surv(tenure, churn) ~ 1, data = groups[[g]])
+  haz_df <- data.frame(
+    time = fit$time,
+    cumhaz = -log(fit$surv)
+  )
+  haz_df$hazard <- c(haz_df$cumhaz[1], diff(haz_df$cumhaz))
+  
+  plot(haz_df$time, haz_df$hazard, type="l", lwd=2,
+       main=paste("Hazard Function -", g),
+       xlab="Tenure (months)", ylab="Hazard")
+}
+par(mfrow=c(1,1))
+
+
+```
+
+
+
+## Log-rank Test & Fleming-Harrington Test
+
+Log-rank test and Fleming–Harrington test are non-parametric hypothesis tests used to compare survival curves across groups.
+
+1. Log-rank Test
+- Purpose: Tests whether two (or more) survival curves are statistically different.
+- Null hypothesis H0 : Survival curves are the same across groups.
+- Alternative: At least one group has different survival.
+
+2. Fleming–Harrington Test
+
+- A generalization of the log-rank test.
+- The log-rank test gives equal weight to all event times.
+- But sometimes we want to give more weight to early events (customers churn quickly) or late events (customers churn after staying long).
+
+
+When to use?
+
+- Log-rank → default, best when hazard functions are proportional.
+- Fleming–Harrington → useful if survival curves cross or if you care about early vs late churn specifically.
+
+```{r}
+library(survival)
+
+# Gender (2 groups)
+survdiff(Surv(tenure, churn) ~ gender, data = df)       
+survdiff(Surv(tenure, churn) ~ gender, data = df, rho=1)  
+
+survdiff(Surv(tenure, churn) ~ contract_length, data = df)       
+survdiff(Surv(tenure, churn) ~ contract_length, data = df, rho=1) 
+
+# Subscription type (3 groups)
+survdiff(Surv(tenure, churn) ~ subscription_type, data = df)      
+survdiff(Surv(tenure, churn) ~ subscription_type, data = df, rho=1) 
+```
+
+
+```{r}
+library(survival)
+library(survMisc)
+
+
+ten_gender   <- ten(Surv(tenure, churn) ~ gender,            data = df)
+ten_contract <- ten(Surv(tenure, churn) ~ contract_length,   data = df)
+ten_subs     <- ten(Surv(tenure, churn) ~ subscription_type, data = df)
+
+# Run FH tests
+
+comp(ten_gender,   p=0, q=0)   # log-rank
+comp(ten_gender,   p=1, q=0)   # early-weighted
+comp(ten_gender,   p=0, q=1)   # late-weighted
+
+comp(ten_contract, p=0, q=0)
+comp(ten_contract, p=1, q=0)
+comp(ten_contract, p=0, q=1)
+
+comp(ten_subs,     p=0, q=0)
+comp(ten_subs,     p=1, q=0)
+comp(ten_subs,     p=0, q=1)
+
+```
+
+
+Gender
+- Log-rank (ρ=0)
+- Female: 127,058 observed vs 107,387 expected events (churns).
+- Male: 122,941 observed vs 142,612 expected.
+- Chisq = 6,595, df=1, p < 2e-16.
+- Females churn much more than expected, males churn much less. Highly significant difference.
+
+Weighted (ρ=1, early emphasis)
+- Still significant: Chisq = 5,566, df=1, p < 2e-16.
+- Confirms females churn earlier and more often than males.
+- Gnder strongly affects churn survival, both early and overall.
+
+Contract Length
+- Log-rank (ρ=0)
+- Annual/Quarterly: fewer churns than expected.
+- Monthly: 87,104 observed vs 47,909 expected → way higher churn.
+- Chisq = 41,409, df=2, p < 2e-16.
+
+Weighted (ρ=1, early emphasis)
+- Monthly still massively worse: 56,963 observed vs 31,512 expected.
+- Chisq = 34,900, df=2, p < 2e-16.
+- Contract length is the strongest predictor: monthly contracts churn very early, while annual/quarterly are protective.
+
+Subscription Type
+- Log-rank (ρ=0)
+- Observed ≈ Expected in all groups.
+- Chisq = 0.9, df=2, p = 0.6 → not significant.
+
+Weighted (ρ=1)
+- Slight imbalance, but still non-significant (Chisq = 4.3, df=2, p = 0.1).
+- Subscription type has no meaningful effect on churn timing.
+
+
+** Summary of Tests **
+
+- Gender: Females churn significantly earlier/more than males. 
+- Contract length: Monthly customers churn much earlier and more often. Strongest signal.
+- Subscription type: No significant effect.
+
+
+
+## Cox Proportional Hazards Modeling
+
+Purpose
+- Quantify the effect of predictors on chunrn risk over time.
+- Expressed as Hazard Ratios (HRs)
+  - HR > 1 : Higher risk of Churn
+  - HR < 1 : Lower Risk (Protective)
+  - HR = 1 : No effect
+  
+```{r}
+# Base Cox Model
+cox_model <- coxph(
+  Surv(tenure, churn) ~ gender + contract_length + subscription_type +
+    age + usage_frequency + support_calls + payment_delay +
+    total_spend + last_interaction,
+  data = df
+)
+
+summary(cox_model)
+```
+
+
+Categorical Variables
+
+Gender (Male vs Female [ref])
+- HR = 0.823, p < 2e-16.
+- Men have ~18% lower risk of churn than women, holding everything else constant.
+- Females churn faster than males.
+
+Contract Length
+- Monthly vs Annual [ref]: HR = 1.622, p < 2e-16. → Monthly contracts have a 62% higher churn risk compared to annual.
+- Quarterly vs Annual: HR ≈ 1.00, p = 0.949. → No meaningful difference from annual.
+- Monthly is risky, quarterly ≈ annual.
+
+Subscription Type
+- Premium: HR = 1.00 (NS).
+- Standard: HR = 0.99 (NS).
+- No meaningful effect on churn compared to Basic.
+
+Continuous Variables
+
+Age: 
+- HR = 1.008 per year, p < 2e-16.
+- Each additional year of age increases churn risk by ~0.8%.
+- Older customers churn slightly faster.
+
+Usage Frequency:
+- HR = 0.999, p < 0.001.
+- More usage → slightly lower churn risk.→ Engagement is protective.
+
+
+Support Calls: 
+- HR = 1.118 per call, p < 2e-16.
+- Each additional support call increases churn risk by 12%.→ Frequent support users churn much more.
+
+Payment Delay: 
+- HR = 1.019 per unit, p < 2e-16.
+- Every extra delay increases churn risk by ~2%. → Late payers churn more.
+
+Total Spend
+- HR = 0.999, p < 2e-16.
+- Higher spend slightly reduces churn risk. → High-spenders are more loyal.
+
+Last Interaction: 
+- HR = 1.010, p < 2e-16.
+- More recent interactions increase churn risk slightly.→ Suggests that customers reaching out more recently are at higher churn risk (likely dissatisfied).
+
+
+Model Fit
+- Concordance (C-index) = 0.706
+- Good discrimination → the model correctly orders churn times ~71% of the time.
+- All global tests (LR, Wald, Score) highly significant (p < 2e-16).
+- Model explains churn timing very well.
+
+Insights:
+- Biggest risks: Monthly contracts, high support callers, frequent late payments.
+- Protective factors: Male gender, higher spend, higher usage frequency.
+- Neutral factors: Subscription type, quarterly contracts.
+
+
+
+## Check Schoenfeld residuals
+
+What are Schoenfeld Residuals?
+- In a Cox model, each event (churn) has a residual for every covariate.
+- They measure the difference between the observed covariate value at the event time and the expected covariate value given the risk set.
+- If the PH assumption holds → the residuals should be uncorrelated with time.
+- If PH is violated → the residuals will show a systematic trend with time.
+
+```{r}
+# Check Proportional Hazards Assumption
+ph_test <- cox.zph(cox_model)
+print(ph_test)   # p > 0.05 → assumption holds
+plot(ph_test)
+```
+Results of cox.zph(cox_model)
+- Gender:	5.1e-05 /  PH assumption violated → effect of gender on churn changes over time.
+- Contract length	; < 2e-16	/ strong violation → hazard ratio for monthly vs annual is not constant across tenure.
+- Subscription type	;	0.0019	/ Violation (small effect, but statistically significant).
+- Age	;	1.2e-07	/ Effect of age is time-varying.
+- Usage frequency	;	1.0e-07	/ Violation.
+- Support calls	;	< 2e-16	/ Strong violation.
+- Payment delay	;	1.8e-09	/ Violation.
+- Total spend	;	< 2e-16	/ Strong violation.
+- Last interaction	;	6.5e-07	/ Violation.
+- GLOBAL	;	< 2e-16	/ Overall PH assumption does not hold for the model.
+
+
+The proportional hazards assumption is violated for almost all predictors.
+In other words: the hazard ratios are not constant over time.
+What we saw in Kaplan–Meier and hazard plots (e.g., monthly contract customers churning early) is confirmed here.
+
+For example:
+The effect of monthly contracts might be much stronger in the first year, then weaker later.
+The effect of support calls may grow stronger as tenure increases.
+
+
+
+## Cox model with stratification by contract length
+
+- contract_length showed the strongest violation of the proportional hazards assumption.
+- Stratification removes its hazard ratio estimate but allows each contract type (Annual, Monthly, Quarterly) to have its own baseline hazard curve.
+- This way, the effects of other covariates are estimated within each stratum, while contract_length differences are absorbed.
+
+```{r}
+# Stratified Cox PH model (stratify by contract_length)
+strat_model <- coxph(
+  Surv(tenure, churn) ~ gender + subscription_type + age +
+    usage_frequency + support_calls + payment_delay +
+    total_spend + last_interaction +
+    strata(contract_length),
+  data = df
+)
+
+summary(strat_model)
+```
+
+
+```{r}
+cox.zph(strat_model)
+```
+Interpretation:
+- Stratifying by contract length fixed its violation, but others remain (support calls, spend, etc.).
+- Hazard ratios give strong, interpretable signals (support calls ↑ risk, total spend ↓ risk).
+- For more rigorous modeling, we’ll need time-varying effects or AFT models.
+
+
+
+
+## Accerlerated Failure Time (AFT) model
+
+What is an AFT model?
+- Instead of modeling hazard ratios (like Cox), the AFT model assumes that covariates accelerate or decelerate survival time.
+- It answers: “How much longer or shorter do customers survive before churn, given their characteristics?”
+- The effect is multiplicative on time, not hazard.
+- Example: If genderMale = 1.2, men’s survival times are 20% longer than women’s.
+
+
+
+Common AFT distributions
+ -Exponential (constant hazard, often too simple).
+- Weibull (flexible, hazard can increase or decrease).
+- Log-normal (time to event follows log-normal).
+- Log-logistic (allows hazards to rise then fall).
+- We usually compare them via AIC / BIC to see which fits best.
+
+
+```{r}
+# Weibull AFT model
+aft_weibull <- survreg(Surv(tenure, churn) ~ gender + contract_length +
+                         subscription_type + age + usage_frequency +
+                         support_calls + payment_delay + total_spend +
+                         last_interaction,
+                       data = df,
+                       dist = "weibull")
+
+summary(aft_weibull)
+
+# Try log-normal as well
+aft_lognormal <- survreg(Surv(tenure, churn) ~ gender + contract_length +
+                           subscription_type + age + usage_frequency +
+                           support_calls + payment_delay + total_spend +
+                           last_interaction,
+                         data = df,
+                         dist = "lognormal")
+
+summary(aft_lognormal)
+
+# Compare model fit (lower AIC = better)
+AIC(aft_weibull, aft_lognormal)
+
+```
+Model Fit (Which is Better?)
+
+- Weibull AFT:
+  - LogLik = –1,161,223
+  - AIC = 2,322,473
+
+- Log-normal AFT:
+  - LogLik = –1,201,799
+  - AIC = 2,403,623
+
+- Lower AIC is better → WeibullAFT model fits your data better than Log-normal.
+
+
+Interpreting Weibull AFT Coefficients
+
+- In AFT models, coefficients represent log-time ratios.
+- Positive coef → longer survival (slower churn).
+- Negative coef → shorter survival (faster churn).
+- exp(coef) → time ratio (multiplier for survival time).
+
+Interpretaion on key predictors:
+- Gender (Male = +0.114): exp(0.114) ≈ 1.12 → men survive ~12% longer than women before churning.
+- Contract length Monthly (–0.279) exp(–0.279) ≈ 0.76 → monthly contracts shorten survival time by ~24% compared to annual (baseline).
+
+
+Cox gave hazard ratios (risk multipliers).
+
+AFT gives time ratios (survival duration multipliers).
+
+Stick with Weibull AFT as best-fitting parametric model.
+
+Summary
+
+- The Weibull AFT model is best parametric fit.
+- Major drivers of shorter survival: monthly contracts, more support calls, higher payment delays, longer since last interaction, older age.
+- Protective factors: being male, higher total spend, higher usage frequency.
+
+
+```{r}
+library(survival)
+
+
+predict_survival <- function(model, newdata, times) {
+  lp <- predict(model, newdata = newdata, type = "lp")
+  scale <- model$scale
+  sapply(times, function(t) exp(- (t / exp(lp))^(1/scale)))
+}
+
+times <- seq(1, 60, by = 1)
+
+
+profiles <- list(
+  Profile1 = data.frame(
+    gender = "Male",
+    contract_length = "Annual",
+    subscription_type = "Basic",
+    age = 40,
+    usage_frequency = 10,
+    support_calls = 2,
+    payment_delay = 5,
+    total_spend = 500,
+    last_interaction = 10
+  ),
+  Profile2 = data.frame(
+    gender = "Female",
+    contract_length = "Monthly",
+    subscription_type = "Premium",
+    age = 30,
+    usage_frequency = 20,
+    support_calls = 5,
+    payment_delay = 2,
+    total_spend = 1000,
+    last_interaction = 3
+  ),
+  Profile3 = data.frame(
+    gender = "Male",
+    contract_length = "Quarterly",
+    subscription_type = "Standard",
+    age = 55,
+    usage_frequency = 5,
+    support_calls = 1,
+    payment_delay = 0,
+    total_spend = 300,
+    last_interaction = 20
+  )
+)
+
+
+surv_profiles <- lapply(profiles, function(p) {
+  predict_survival(aft_weibull, newdata = p, times)
+})
+
+
+plot(times, surv_profiles[[1]], type = "l", lwd = 2, col = "blue",
+     ylim = c(0,1), xlab = "Tenure (months)", ylab = "Survival Probability",
+     main = "Predicted Survival Curves by Different Profiles")
+lines(times, surv_profiles[[2]], col = "red", lwd = 2)
+lines(times, surv_profiles[[3]], col = "green", lwd = 2)
+legend("topright", legend = names(profiles), col = c("blue","red","green"), lwd = 2)
+```
+
+Cox Proportional Hazards Model
+
+- Semi-parametric: It doesn’t assume a distribution for survival times.
+- Focuses on hazard ratios (relative risk).
+- Assumes proportional hazards (the effect of a covariate is constant over time).
+- Flexible, widely used, easier to interpret in terms of risk.
+- But… in your results, the Schoenfeld test + residual plots showed violations of proportional hazards, which weakens the Cox model’s validity.
+
+
+
+Accelerated Failure Time (AFT) Model
+
+- Parametric: Assumes a distribution for survival times (Weibull, lognormal, etc.).
+- Focuses on time ratios: covariates accelerate or decelerate the survival time.
+- More interpretable in business terms: e.g., “Monthly contracts reduce survival time by 40% compared to Annual.”
+- Handles non-proportional hazards better (since it models survival time directly).
+- Needs the right distribution — misspecification can bias results.
+- In your case, the Weibull AFT had better fit (lower AIC) than lognormal.
+
+
+Results Comparison
+- Cox model: Concordance ~0.70 (pretty good), but proportional hazards assumption failed (cox.zph significant for many covariates).
+- AFT (Weibull): AIC much lower than lognormal, strong significance for most predictors, interpretable as “time acceleration/deceleration.”
+- Subscription type remained not significant in both models → consistent.
+
+
+Conclusion
+- Since proportional hazards are violated, the AFT model is more appropriate.
+- Among AFT options, Weibull fits better than lognormal (based on AIC).
+- But Cox can still be used as a benchmark model, since many readers are more familiar with hazard ratios.
+
+
+
+
+
+
